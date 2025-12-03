@@ -1,0 +1,53 @@
+#!/bin/bash
+set -e
+
+# Post-installation script for lunasched v1.2.0
+
+# Create lunasched user if it doesn't exist
+if ! id "lunasched" &>/dev/null; then
+    useradd -r -s /bin/false -d /var/lib/lunasched -M lunasched
+fi
+
+# Create directory structure
+mkdir -p /var/lib/lunasched
+mkdir -p /var/log/lunasched
+mkdir -p /var/run/lunasched
+mkdir -p /etc/lunasched
+
+# Set ownership and permissions
+chown lunasched:lunasched /var/lib/lunasched
+chmod 750 /var/lib/lunasched
+
+chown lunasched:lunasched /var/log/lunasched
+chmod 750 /var/log/lunasched
+
+# Socket directory needs to be accessible by all users for CLI communication
+chown lunasched:lunasched /var/run/lunasched
+chmod 755 /var/run/lunasched
+
+# Config directory readable by all
+chown root:root /etc/lunasched
+chmod 755 /etc/lunasched
+
+if [ -f /etc/lunasched/config.yaml ]; then
+    chown root:root /etc/lunasched/config.yaml
+    chmod 644 /etc/lunasched/config.yaml
+fi
+
+# Reload systemd and enable service
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable lunasched.service || true
+    
+    echo ""
+    echo "=========================================="
+    echo "Lunasched v1.2.0 installed successfully!"
+    echo "=========================================="
+    echo ""
+    echo "Config: /etc/lunasched/config.yaml"
+    echo "Docs:   /usr/share/doc/lunasched/"
+    echo ""
+    echo "Start: sudo systemctl start lunasched"
+    echo "=========================================="
+    echo ""
+fi

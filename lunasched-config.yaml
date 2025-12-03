@@ -1,0 +1,47 @@
+# Example Lunasched Configuration
+# Place this file at /etc/lunasched/config.yaml
+
+# Global Settings
+global:
+  # Database path (default: /var/lib/lunasched/lunasched.db)
+  database_path: /var/lib/lunasched/lunasched.db
+  
+  # Log files
+  daemon_log: /var/log/lunasched/daemon.log
+  jobs_log: /var/log/lunasched/jobs.log
+  
+  # Socket path for CLI communication
+  socket_path: /var/run/lunasched/lunasched.sock
+  
+  # Default timezone for jobs (if not specified per-job)
+  default_timezone: "UTC"
+
+# Default job settings (applied to all jobs unless overridden)
+defaults:
+  retry_policy:
+    max_attempts: 0
+    backoff_strategy: Exponential
+    initial_delay_seconds: 60
+    max_delay_seconds: 3600
+  
+  resource_limits:
+    timeout_seconds: null
+    max_memory_mb: null
+    cpu_quota: null
+  
+  priority: Normal
+  execution_mode: Sequential
+  jitter_seconds: 0
+
+# Email notification settings (optional)
+notifications:
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    smtp_username: "your-email@gmail.com"
+    smtp_password: "your-app-password"
+    from_address: "lunasched@yourdomain.com"
+
+# You can define jobs here or add them via the CLI
+jobs:

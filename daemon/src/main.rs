@@ -1,5 +1,10 @@
 mod scheduler;
 mod db;
+mod migrations;
+mod config;
+mod resource_manager;
+mod notifier;
+mod metrics;
 
 use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,8 +19,19 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Starting lunasched-daemon...");
 
     let db_path = common::DEFAULT_DB_PATH;
-    let db = match Db::new(db_path) {
-        Ok(db) => Some(Arc::new(Mutex::new(db))),
+    
+    // Open database and run migrations
+    let db = match rusqlite::Connection::open(db_path) {
+        Ok(conn) => {
+            log::info!("Database opened at {}", db_path);
+            let mut migrator = migrations::Migrator::new(conn);
+            if let Err(e) = migrator.run_migrations() {
+                log::error!("Failed to run database migrations: {}", e);
+                return Err(anyhow::anyhow!("Migration failed: {}", e));
+            }
+            let conn = migrator.into_connection();
+            Some(Arc::new(Mutex::new(Db::from_connection(conn))))
+        },
         Err(e) => {
             log::error!("Failed to open database at {}: {}", db_path, e);
             None
@@ -25,11 +41,43 @@ async fn main() -> anyhow::Result<()> {
     let scheduler = Arc::new(Mutex::new(Scheduler::new(db)));
     let socket_path = common::DEFAULT_SOCKET_PATH;
 
+    // Ensure parent directory exists (critical for /var/run/lunasched after reboot)
+    if let Some(parent) = std::path::Path::new(socket_path).parent() {
+        if !parent.exists() {
+            log::info!("Creating socket directory: {}", parent.display());
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::error!("Failed to create socket directory {}: {}", parent.display(), e);
+                return Err(anyhow::anyhow!("Failed to create socket directory: {}", e));
+            }
+            
+            // Set directory permissions to allow all users to access
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(parent)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(parent, perms)?;
+            log::info!("Socket directory created with permissions 0755");
+        }
+    }
+
+    // Remove stale socket file if it exists
     if std::path::Path::new(socket_path).exists() {
+        log::info!("Removing stale socket file: {}", socket_path);
         std::fs::remove_file(socket_path)?;
     }
 
-    let listener = UnixListener::bind(socket_path)?;
+    // Bind to socket
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(listener) => {
+            log::info!("Successfully bound to socket: {}", socket_path);
+            listener
+        },
+        Err(e) => {
+            log::error!("Failed to bind to socket {}: {}", socket_path, e);
+            log::error!("Possible causes: insufficient permissions, path issues, or another instance running");
+            return Err(anyhow::anyhow!("Failed to bind to socket: {}", e));
+        }
+    };
+    
     println!("Listening on {}", socket_path);
     
     // Set socket permissions to allow all users to connect
@@ -37,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let mut perms = std::fs::metadata(socket_path)?.permissions();
     perms.set_mode(0o666);
     std::fs::set_permissions(socket_path, perms)?;
+    log::info!("Socket permissions set to 0666");
 
     // Spawn scheduler tick loop
     let tick_scheduler = scheduler.clone();
@@ -53,14 +102,15 @@ async fn main() -> anyhow::Result<()> {
                 let s = tick_scheduler.clone();
                 tokio::spawn(async move {
                     let sched = s.lock().unwrap();
-                    sched.execute_job(&job);
+                    sched.execute_job(&job, s.clone());
                 });
             }
         }
     });
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (mut socket, addr) = listener.accept().await?;
+        log::info!("New connection accepted from {:?}", addr);
         let scheduler = scheduler.clone();
 
         tokio::spawn(async move {
@@ -87,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(req) => req,
                     Err(e) => {
                         log::error!("failed to deserialize request; err = {:?}", e);
+                        log::error!("Raw bytes received: {} bytes", n);
                         return;
                     }
                 };
@@ -126,9 +177,28 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(job) = sched.jobs.get(&job_id.0) {
                              if job.owner != requester_owner && requester_owner != "root" {
                                  Response::Error(format!("Permission denied: Cannot start job owned by {}", job.owner))
+                             } else if sched.running_jobs.contains_key(&job_id.0) {
+                                 Response::Error("Job is already running".to_string())
                              } else {
                                  let job_clone = job.clone();
-                                 sched.execute_job(&job_clone);
+                                 
+                                 // Create execution context for manual start
+                                 let execution_id = uuid::Uuid::new_v4().to_string();
+                                 let now = chrono::Utc::now();
+                                 sched.running_jobs.insert(
+                                     job_id.0.clone(),
+                                     scheduler::JobExecutionContext {
+                                         execution_id: execution_id.clone(),
+                                         scheduled_time: now,
+                                         start_time: now,
+                                         pid: None,
+                                     },
+                                 );
+                                 
+                                 log::info!("Manually starting job: {} (execution_id: {})", job_clone.name, execution_id);
+                                 
+                                 let s = scheduler.clone();
+                                 sched.execute_job(&job_clone, s);
                                  Response::Ok
                              }
                         } else {

@@ -1,0 +1,18 @@
+#!/bin/bash
+set -e
+
+# Post-removal script - clean up on purge
+if [ "$1" = "purge" ]; then
+    # Remove data and logs
+    rm -rf /var/lib/lunasched
+    rm -rf /var/log/lunasched
+    rm -rf /var/run/lunasched
+    
+    # Remove user
+    if id "lunasched" &>/dev/null; then
+        userdel lunasched || true
+    fi
+    
+    # Note: We don't remove /etc/lunasched/config.yaml 
+    # as it's marked as a conffile in debian package
+fi

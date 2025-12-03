@@ -1,20 +1,74 @@
 [package]
 name = "lunasched-daemon"
-version = "1.0.0"
+version = "1.2.4"
 edition = "2021"
+description = "Production-ready cron replacement with advanced scheduling, notifications, and metrics"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 common = { path = "../common" }
 cron = "0.12"
 chrono = "0.4"
+chrono-tz = "0.8"
 log = "0.4"
 env_logger = "0.10"
 fern = "0.6"
 rusqlite = { version = "0.29", features = ["bundled"] }
-nix = { version = "0.27", features = ["user", "process"] }
+nix = { version = "0.27", features = ["user", "process", "signal"] }
+sysinfo = "0.30"
+rand = "0.8"
+lettre = "0.11"
+reqwest = { version = "0.11", features = ["json"] }
+notify = "6.0"
+csv = "1.3"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+dashmap = "5.5"
 
+[package.metadata.deb]
+name = "lunasched"
+maintainer = "Lunasched Team <team@lunasched.io>"
+copyright = "2025, Lunasched Team"
+license-file = ["../LICENSE", "4"]
+extended-description = """\
+Lunasched v1.2.0 - Production-ready cron replacement with advanced features.
+
+Features:
+ * Flexible scheduling (every X, at HH:MM, cron expressions)
+ * Job priorities (Critical, High, Normal, Low)
+ * Execution modes (Sequential, Parallel, Exclusive)
+ * Multi-channel notifications (Email, Slack, Discord, Webhooks)
+ * Retry policies with exponential backoff
+ * Resource limits (timeout, memory, CPU)
+ * Prometheus metrics export
+ * Timezone-aware scheduling
+ * Job dependencies and hooks
+ * Comprehensive execution tracking with UUIDs
+ * SQLite persistence with auto-migration
+"""
+depends = "$auto, systemd"
+section = "admin"
+priority = "optional"
+assets = [
+    # Binaries (from workspace target dir)
+    ["../target/release/lunasched-daemon", "usr/local/bin/lunasched-daemon", "755"],
+    ["../target/release/lunasched", "usr/local/bin/lunasched", "755"],
+    
+    # Systemd service (from project root)
+    ["../lunasched.service", "lib/systemd/system/lunasched.service", "644"],
+    
+    # Configuration (from project root)
+    ["../lunasched-config.yaml", "etc/lunasched/config.yaml", "644"],
+    
+    # Documentation (from project root)
+    ["../README.md", "usr/share/doc/lunasched/README.md", "644"],
+    ["../docs/PRODUCTION_JOBS.md", "usr/share/doc/lunasched/PRODUCTION_JOBS.md", "644"],
+]
+maintainer-scripts = "../debian"
+conf-files = ["/etc/lunasched/config.yaml"]

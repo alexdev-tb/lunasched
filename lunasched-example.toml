@@ -1,0 +1,35 @@
+# Lunasched Configuration Example
+
+[server]
+tick_interval_ms = 1000
+max_concurrent_jobs = 10
+data_dir = "./"
+socket_path = "/tmp/lunasched.sock"
+
+[logging]
+level = "info"
+format = "text"
+
+[retention]
+history_days = 30
+max_history_per_job = 100
+
+# Example job with retry policy
+[[jobs]]
+name = "backup-job"
+schedule = "at 02:00"
+command = "/usr/local/bin/backup.sh"
+timezone = "America/New_York"
+max_retries = 3
+timeout = 3600
+jitter = 300
+on_failure = "echo 'Backup failed!' | mail -s 'Backup Alert' admin@example.com"
+
+# Example job with jitter for distributed systems
+[[jobs]]
+name = "cache-refresh"
+schedule = "every 5m"
+command = "/usr/bin/refresh-cache"
+jitter = 60  # Random delay up to 60 seconds
+max_retries = 2
+timeout = 120

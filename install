@@ -1,0 +1,66 @@
+#!/bin/bash
+set -e
+
+echo "Building Lunasched..."
+cargo build --release
+
+echo "Stopping service..."
+sudo systemctl stop lunasched || true
+
+echo "Installing binaries..."
+sudo cp target/release/lunasched-daemon /usr/local/bin/
+sudo cp target/release/lunasched /usr/local/bin/
+
+echo "Creating lunasched user..."
+if ! id "lunasched" &>/dev/null; then
+    sudo useradd -r -s /bin/false -d /var/lib/lunasched lunasched
+fi
+
+echo "Creating directory structure..."
+sudo mkdir -p /var/lib/lunasched
+sudo mkdir -p /var/log/lunasched
+sudo mkdir -p /var/run/lunasched
+sudo mkdir -p /etc/lunasched
+
+echo "Setting permissions..."
+sudo chown lunasched:lunasched /var/lib/lunasched
+sudo chmod 750 /var/lib/lunasched
+
+sudo chown lunasched:lunasched /var/log/lunasched
+sudo chmod 750 /var/log/lunasched
+
+sudo chown lunasched:lunasched /var/run/lunasched
+sudo chmod 750 /var/run/lunasched
+
+# Config directory is readable by all but only writable by root
+sudo chown root:root /etc/lunasched
+sudo chmod 755 /etc/lunasched
+
+echo "Installing default configuration..."
+if [ ! -f /etc/lunasched/config.yaml ]; then
+    sudo cp lunasched-config.yaml /etc/lunasched/config.yaml
+    sudo chmod 644 /etc/lunasched/config.yaml
+    echo "  ✓ Default config installed to /etc/lunasched/config.yaml"
+else
+    echo "  ℹ Config file already exists at /etc/lunasched/config.yaml (not overwriting)"
+fi
+
+echo "Installing systemd service..."
+sudo cp lunasched.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable lunasched
+sudo systemctl restart lunasched
+
+echo ""
+echo "============================================"
+echo "Installation complete!"
+echo "============================================"
+echo "Lunasched v1.2.0 is running as a system service."
+echo ""
+echo "Configuration: /etc/lunasched/config.yaml"
+echo "Database:      /var/lib/lunasched/lunasched.db"
+echo "Logs:          /var/log/lunasched/"
+echo ""
+echo "Use 'lunasched' to interact with the daemon."
+echo "See docs/PRODUCTION_JOBS.md for job creation examples."
+echo ""

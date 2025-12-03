@@ -1,15 +1,35 @@
 use common::{Job, ScheduleConfig};
 use cron::Schedule;
 use std::str::FromStr;
-use chrono::{Utc, DateTime, Duration};
+use chrono::{Utc, DateTime, Duration, Timelike};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::db::Db;
+use crate::resource_manager;
+use dashmap::DashMap;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct JobExecutionContext {
+    pub execution_id: String,
+    pub scheduled_time: DateTime<Utc>,
+    pub start_time: DateTime<Utc>,
+    pub pid: Option<u32>,
+}
 
 pub struct Scheduler {
     pub jobs: HashMap<String, Job>,
     pub last_runs: HashMap<String, DateTime<Utc>>,
+    pub last_execution_windows: HashMap<String, DateTime<Utc>>, // Track scheduled window to prevent duplicates
+    pub running_jobs: Arc<DashMap<String, JobExecutionContext>>, // Enhanced with execution context
     pub db: Option<Arc<Mutex<Db>>>,
+    pub retry_state: HashMap<String, RetryState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
 impl Scheduler {
@@ -24,7 +44,10 @@ impl Scheduler {
         Self {
             jobs,
             last_runs: HashMap::new(),
+            last_execution_windows: HashMap::new(),
+            running_jobs: Arc::new(DashMap::new()),
             db,
+            retry_state: HashMap::new(),
         }
     }
 
@@ -46,9 +69,57 @@ impl Scheduler {
         let mut jobs_to_run = Vec::new();
         let now = Utc::now();
         
+        // Check for scheduled retries
+        let retry_jobs: Vec<String> = self.retry_state.iter()
+            .filter_map(|(job_id, state)| {
+                if let Some(next_attempt) = state.next_attempt_at {
+                    if next_attempt <= now {
+                        Some(job_id.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        for job_id in retry_jobs {
+            if let Some(job) = self.jobs.get(&job_id) {
+                if !self.running_jobs.contains_key(&job_id) {
+                    log::info!("Retrying job: {} (attempt {})", job.name, 
+                        self.retry_state.get(&job_id).map(|s| s.attempt + 1).unwrap_or(1));
+                    
+                    let execution_id = Uuid::new_v4().to_string();
+                    let now = Utc::now();
+                    
+                    jobs_to_run.push(job.clone());
+                    self.running_jobs.insert(
+                        job_id.clone(),
+                        JobExecutionContext {
+                            execution_id,
+                            scheduled_time: now,
+                            start_time: now,
+                            pid: None,
+                        },
+                    );
+                }
+            }
+        }
+        
         for job in self.jobs.values() {
-            let last_run = self.last_runs.get(&job.id.0).cloned().unwrap_or_else(|| DateTime::<Utc>::MIN_UTC);
-            
+            if !job.enabled {
+                continue;
+            }
+
+            // Concurrency check - use contains_key instead of hashset
+            if self.running_jobs.contains_key(&job.id.0) {
+                continue;
+            }
+
+            let last_run = self.last_runs.get(&job.id.0).cloned().unwrap_or(DateTime::<Utc>::MIN_UTC);
+            let mut next_run_time = now;
+
             let should_run = match &job.schedule {
                 ScheduleConfig::Cron(expression) => {
                     if let Ok(schedule) = Schedule::from_str(expression) {
@@ -59,7 +130,12 @@ impl Scheduler {
                         };
 
                         if let Some(next) = schedule.after(&start_time).next() {
-                            next <= now
+                            if next <= now {
+                                next_run_time = next;
+                                true
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         }
@@ -70,26 +146,187 @@ impl Scheduler {
                 ScheduleConfig::Every(seconds) => {
                     let interval = Duration::seconds(*seconds as i64);
                     if last_run == DateTime::<Utc>::MIN_UTC {
+                        next_run_time = now;
                         true 
                     } else {
-                        now - last_run >= interval
+                        let expected = last_run + interval;
+                        if expected <= now {
+                            next_run_time = expected;
+                            // Lag check: if we are behind by more than 10 intervals, reset to now
+                            if (now - expected) > (interval * 10) {
+                                log::warn!("Job {} is lagging significantly. Resetting schedule.", job.name);
+                                next_run_time = now;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                },
+                ScheduleConfig::Calendar(params) => {
+                    // Use configured timezone or Local time for calendar matching
+                    let now_local = if let Some(ref tz_str) = job.timezone {
+                        use chrono_tz::Tz;
+                        if let Ok(tz) = tz_str.parse::<Tz>() {
+                            now.with_timezone(&tz).naive_local()
+                        } else {
+                            log::warn!("Invalid timezone '{}' for job {}, using local time", tz_str, job.name);
+                            chrono::Local::now().naive_local()
+                        }
+                    } else {
+                        chrono::Local::now().naive_local()
+                    };
+                    
+                    // CRITICAL BUG FIX: Use minute-level precision and execution window tracking
+                    // Create a window identifier based on the current minute (not second)
+                    let current_window = now_local.with_second(0).unwrap().with_nanosecond(0).unwrap();
+                    let last_window = self.last_execution_windows
+                        .get(&job.id.0)
+                        .and_then(|dt| {
+                            if let Some(ref tz_str) = job.timezone {
+                                use chrono_tz::Tz;
+                                if let Ok(tz) = tz_str.parse::<Tz>() {
+                                    Some(dt.with_timezone(&tz).naive_local().with_second(0).unwrap().with_nanosecond(0).unwrap())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                Some(dt.with_timezone(&chrono::Local).naive_local().with_second(0).unwrap().with_nanosecond(0).unwrap())
+                            }
+                        });
+                    
+                    // Prevent running twice in the same minute window
+                    if let Some(last_win) = last_window {
+                        if last_win == current_window {
+                            false
+                        } else {
+                            use chrono::{Datelike, Timelike};
+                            let (h, m, s) = params.time;
+                            
+                            if now_local.hour() == h && now_local.minute() == m && now_local.second() == s {
+                                let mut day_match = true;
+                                
+                                if let Some(days) = &params.days_of_week {
+                                    let current_iso_day = now_local.weekday().number_from_monday();
+                                    if !days.contains(&current_iso_day) {
+                                        day_match = false;
+                                    }
+                                }
+                                
+                                if let Some((n, weekday)) = params.nth_weekday {
+                                    let current_iso_day = now_local.weekday().number_from_monday();
+                                    if current_iso_day != weekday {
+                                        day_match = false;
+                                    } else {
+                                        let day = now_local.day();
+                                        let week_num = (day - 1) / 7 + 1;
+                                        if week_num != n {
+                                            day_match = false;
+                                        }
+                                    }
+                                }
+                                
+                                if day_match {
+                                    next_run_time = now;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    } else {
+                        // First run or no execution window recorded
+                        use chrono::{Datelike, Timelike};
+                        let (h, m, s) = params.time;
+                        
+                        if now_local.hour() == h && now_local.minute() == m && now_local.second() == s {
+                            let mut day_match = true;
+                            
+                            if let Some(days) = &params.days_of_week {
+                                let current_iso_day = now_local.weekday().number_from_monday();
+                                if !days.contains(&current_iso_day) {
+                                    day_match = false;
+                                }
+                            }
+                            
+                            if let Some((n, weekday)) = params.nth_weekday {
+                                let current_iso_day = now_local.weekday().number_from_monday();
+                                if current_iso_day != weekday {
+                                    day_match = false;
+                                } else {
+                                    let day = now_local.day();
+                                    let week_num = (day - 1) / 7 + 1;
+                                    if week_num != n {
+                                        day_match = false;
+                                    }
+                                }
+                            }
+                            
+                            if day_match {
+                                next_run_time = now;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
                 },
             };
 
             if should_run {
+                // Apply jitter if configured
+                if job.jitter_seconds > 0 {
+                    use rand::Rng;
+                    let jitter_ms = rand::thread_rng().gen_range(0..job.jitter_seconds * 1000);
+                    next_run_time = next_run_time + Duration::milliseconds(jitter_ms as i64);
+                    log::debug!("Applied jitter of {}ms to job {}", jitter_ms, job.name);
+                }
+                
+                // Create execution context
+                let execution_id = Uuid::new_v4().to_string();
+                log::info!("Scheduling job: {} (execution_id: {})", job.name, execution_id);
+                
                 jobs_to_run.push(job.clone());
-                self.last_runs.insert(job.id.0.clone(), now);
+                self.last_runs.insert(job.id.0.clone(), next_run_time);
+                self.last_execution_windows.insert(job.id.0.clone(), next_run_time);
+                
+                // Insert execution context
+                self.running_jobs.insert(
+                    job.id.0.clone(),
+                    JobExecutionContext {
+                        execution_id,
+                        scheduled_time: next_run_time,
+                        start_time: now,
+                        pid: None,
+                    },
+                );
             }
         }
         jobs_to_run
     }
 
-    pub fn execute_job(&self, job: &Job) {
-        log::info!("Executing job: {} (owner: {})", job.name, job.owner);
+    pub fn finish_job(&mut self, id: &str) {
+        self.running_jobs.remove(id);
+    }
+
+    pub fn execute_job(&self, job: &Job, scheduler: Arc<Mutex<Scheduler>>) {
+        let current_attempt = {
+            let sched = scheduler.lock().unwrap();
+            sched.retry_state.get(&job.id.0).map(|s| s.attempt).unwrap_or(0)
+        };
+        
+        log::info!("Executing job: {} (owner: {}, attempt: {})", job.name, job.owner, current_attempt + 1);
+        
         let mut cmd = tokio::process::Command::new(&job.command);
         cmd.args(&job.args);
         cmd.envs(&job.env);
+        
+        // Apply resource limits if configured
+        let resource_limits = job.resource_limits.clone();
         
         if job.owner == "lunasched" {
             match nix::unistd::User::from_name("lunasched") {
@@ -101,15 +338,12 @@ impl Scheduler {
                         cmd.pre_exec(move || {
                             let c_user = std::ffi::CString::new("lunasched").unwrap();
                             
-                            // Set groups first (requires root)
                             nix::unistd::initgroups(&c_user, gid)
                                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                                 
-                            // Set GID
                             nix::unistd::setgid(gid)
                                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                                 
-                            // Set UID last (drops root)
                             nix::unistd::setuid(uid)
                                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                                 
@@ -132,41 +366,144 @@ impl Scheduler {
         let job_name = job.name.clone();
         let job_id = job.id.0.clone();
         let db = self.db.clone();
+        let retry_policy = job.retry_policy.clone();
+        let hooks = job.hooks.clone();
 
         match cmd.spawn() {
             Ok(child) => {
+                let pid = child.id().unwrap();
+                
+                // Spawn timeout enforcer if configured
+                if let Some(timeout_secs) = resource_limits.timeout_seconds {
+                    let pid_clone = pid;
+                    tokio::spawn(async move {
+                        if let Err(e) = resource_manager::ResourceManager::enforce_timeout(pid_clone, timeout_secs).await {
+                            log::warn!("Timeout enforced: {}", e);
+                        }
+                    });
+                }
+                
                 tokio::spawn(async move {
-                    let child = child;
+                    let start_time = std::time::Instant::now();
                     match child.wait_with_output().await {
                         Ok(output) => {
-                            let status = output.status.to_string();
+                            let duration_ms = start_time.elapsed().as_millis() as i64;
+                            let success = output.status.success();
+                            let exit_code = output.status.code().unwrap_or(-1);
+                            
                             let stdout = String::from_utf8_lossy(&output.stdout);
                             let stderr = String::from_utf8_lossy(&output.stderr);
                             let log_output = format!("Stdout:\n{}\nStderr:\n{}", stdout, stderr);
                             
-                            log::info!("Job {} finished with status: {}", job_name, status);
+                            let status_str = if success { "success" } else { "failed" };
+                            log::info!("Job {} finished with status: {} (exit code: {}, duration: {}ms)", 
+                                job_name, status_str, exit_code, duration_ms);
                             log::info!(target: "job_output", "Job: {}\n{}", job_name, log_output);
 
-                            if let Some(db) = db {
-                                let _ = db.lock().unwrap().log_history(&job_id, &status, &log_output);
+                            // Update metrics
+                            if let Some(ref db) = db {
+                                let _ = db.lock().unwrap().update_job_metrics(&job_id, success, duration_ms);
+                            }
+
+                            if success {
+                                // Job succeeded - clear retry state and run success hook
+                                {
+                                    let mut sched = scheduler.lock().unwrap();
+                                    sched.retry_state.remove(&job_id);
+                                }
+                                
+                                if let Some(ref db) = db {
+                                    let _ = db.lock().unwrap().log_history(&job_id, status_str, &log_output);
+                                }
+                                
+                                // Run success hook if configured
+                                if let Some(on_success) = hooks.on_success {
+                                    log::info!("Running success hook for job {}", job_name);
+                                    let _ = std::process::Command::new("sh")
+                                        .arg("-c")
+                                        .arg(&on_success)
+                                        .spawn();
+                                }
+                            } else {
+                                // Job failed - check retry policy
+                                let should_retry = current_attempt < retry_policy.max_attempts;
+                                
+                                if should_retry {
+                                    let next_attempt = current_attempt + 1;
+                                    let delay_secs = resource_manager::calculate_backoff_delay(
+                                        current_attempt,
+                                        &retry_policy.backoff_strategy,
+                                        retry_policy.initial_delay_seconds,
+                                        retry_policy.max_delay_seconds,
+                                    );
+                                    
+                                    let next_attempt_at = Utc::now() + Duration::seconds(delay_secs as i64);
+                                    log::warn!("Job {} failed (attempt {}/{}). Retrying in {}s", 
+                                        job_name, next_attempt, retry_policy.max_attempts, delay_secs);
+                                    
+                                    {
+                                        let mut sched = scheduler.lock().unwrap();
+                                        sched.retry_state.insert(job_id.clone(), RetryState {
+                                            attempt: next_attempt,
+                                            next_attempt_at: Some(next_attempt_at),
+                                        });
+                                    }
+                                    
+                                    if let Some(ref db) = db {
+                                        let next_retry_str = next_attempt_at.format("%Y-%m-%d %H:%M:%S").to_string();
+                                        let _ = db.lock().unwrap().log_retry_attempt(
+                                            &job_id,
+                                            next_attempt,
+                                            Some(&next_retry_str),
+                                            &format!("Exit code: {}", exit_code)
+                                        );
+                                    }
+                                } else {
+                                    // All retries exhausted
+                                    log::error!("Job {} failed after {} attempts", job_name, current_attempt + 1);
+                                    {
+                                        let mut sched = scheduler.lock().unwrap();
+                                        sched.retry_state.remove(&job_id);
+                                    }
+                                    
+                                    if let Some(ref db) = db {
+                                        let _ = db.lock().unwrap().log_history(&job_id, "failed", &log_output);
+                                    }
+                                    
+                                    // Run failure hook if configured
+                                    if let Some(on_failure) = hooks.on_failure {
+                                        log::info!("Running failure hook for job {}", job_name);
+                                        let _ = std::process::Command::new("sh")
+                                            .arg("-c")
+                                            .arg(&on_failure)
+                                            .spawn();
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
                             let err_msg = format!("Failed to wait: {}", e);
                             log::error!("Job {} {}", job_name, err_msg);
-                             if let Some(db) = db {
+                            
+                            if let Some(ref db) = db {
                                 let _ = db.lock().unwrap().log_history(&job_id, "Error", &err_msg);
                             }
                         },
                     }
+                    
+                    // Mark job as finished
+                    scheduler.lock().unwrap().finish_job(&job_id);
                 });
             }
             Err(e) => {
                 let err_msg = format!("Failed to spawn: {}", e);
                 log::error!("Failed to spawn job {}: {}", job.name, e);
-                 if let Some(db) = db {
+                
+                if let Some(ref db) = db {
                     let _ = db.lock().unwrap().log_history(&job_id, "SpawnError", &err_msg);
                 }
+                
+                scheduler.lock().unwrap().finish_job(&job_id);
             },
         }
     }

@@ -3,3 +3,6 @@
 *.db
 *.db-journal
 .DS_Store
+debian-binary
+data.tar.xz
+control.tar.xz

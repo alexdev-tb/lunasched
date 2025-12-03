@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Pre-removal script - stop service before removing files
+if [ -d /run/systemd/system ]; then
+    systemctl stop lunasched.service || true
+    systemctl disable lunasched.service || true
+fi
