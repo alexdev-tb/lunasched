@@ -8,7 +8,7 @@ pub enum Request {
     ListJobs,
     GetJob(JobId),
     StartJob(JobId),
-    GetHistory(JobId),
+    GetHistory { job_id: JobId, limit: Option<usize> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

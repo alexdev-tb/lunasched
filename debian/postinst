@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-# Post-installation script for lunasched v1.2.0
+# Post-installation script for lunasched v1.4.0
 
-# Create lunasched user if it doesn't exist
+# Create lunasched user if it doesn't exist (needed for job execution)
 if ! id "lunasched" &>/dev/null; then
     useradd -r -s /bin/false -d /var/lib/lunasched -M lunasched
 fi
@@ -15,14 +15,15 @@ mkdir -p /var/run/lunasched
 mkdir -p /etc/lunasched
 
 # Set ownership and permissions
-chown lunasched:lunasched /var/lib/lunasched
-chmod 750 /var/lib/lunasched
+# Note: Daemon runs as root but jobs execute as lunasched user via sudo
+chown root:root /var/lib/lunasched
+chmod 755 /var/lib/lunasched
 
-chown lunasched:lunasched /var/log/lunasched
-chmod 750 /var/log/lunasched
+chown root:root /var/log/lunasched
+chmod 755 /var/log/lunasched
 
 # Socket directory needs to be accessible by all users for CLI communication
-chown lunasched:lunasched /var/run/lunasched
+chown root:root /var/run/lunasched
 chmod 755 /var/run/lunasched
 
 # Config directory readable by all
@@ -34,20 +35,26 @@ if [ -f /etc/lunasched/config.yaml ]; then
     chmod 644 /etc/lunasched/config.yaml
 fi
 
+# Set permissions on sudoers file (must be 440)
+if [ -f /etc/sudoers.d/lunasched ]; then
+    chown root:root /etc/sudoers.d/lunasched
+    chmod 440 /etc/sudoers.d/lunasched
+fi
+
 # Reload systemd and enable service
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     systemctl enable lunasched.service || true
+    systemctl restart lunasched.service || true
     
     echo ""
     echo "=========================================="
-    echo "Lunasched v1.2.0 installed successfully!"
+    echo "Lunasched v1.4.0 installed successfully!"
     echo "=========================================="
     echo ""
     echo "Config: /etc/lunasched/config.yaml"
     echo "Docs:   /usr/share/doc/lunasched/"
     echo ""
-    echo "Start: sudo systemctl start lunasched"
     echo "=========================================="
     echo ""
 fi

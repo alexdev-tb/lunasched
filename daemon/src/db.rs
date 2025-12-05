@@ -156,15 +156,25 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_history(&self, job_id: &str) -> Result<Vec<common::HistoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, job_id, run_at, status, output 
-             FROM history 
-             WHERE job_id = ?1 
-             ORDER BY run_at DESC 
-             LIMIT 100"
-        )?;
+    pub fn get_history(&self, job_id: &str, limit: Option<usize>) -> Result<Vec<common::HistoryEntry>> {
+        let query = match limit {
+            Some(n) => format!(
+                "SELECT id, job_id, run_at, status, output 
+                 FROM history 
+                 WHERE job_id = ?1 
+                 ORDER BY run_at DESC 
+                 LIMIT {}", n
+            ),
+            None => String::from(
+                "SELECT id, job_id, run_at, status, output 
+                 FROM history 
+                 WHERE job_id = ?1 
+                 ORDER BY run_at DESC"
+            ),
+        };
         
+        let mut stmt = self.conn.prepare(&query)?;
+    
         let history_iter = stmt.query_map(params![job_id], |row| {
             Ok(common::HistoryEntry {
                 id: row.get(0)?,
@@ -187,23 +197,6 @@ impl Db {
             "INSERT INTO retry_attempts (job_id, attempt_number, next_retry_at, error) 
              VALUES (?1, ?2, ?3, ?4)",
             params![job_id, attempt, next_retry, error],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_job_metrics(&self, job_id: &str, success: bool, duration_ms: i64) -> Result<()> {
-        // Insert or update metrics
-        self.conn.execute(
-            "INSERT INTO job_metrics (job_id, total_runs, successful_runs, failed_runs, last_duration_ms, last_run_at)
-             VALUES (?1, 1, ?2, ?3, ?4, datetime('now'))
-             ON CONFLICT(job_id) DO UPDATE SET
-                total_runs = total_runs + 1,
-                successful_runs = successful_runs + ?2,
-                failed_runs = failed_runs + ?3,
-                last_duration_ms = ?4,
-                avg_duration_ms = (avg_duration_ms * total_runs + ?4) / (total_runs + 1),
-                last_run_at = datetime('now')",
-            params![job_id, if success { 1 } else { 0 }, if success { 0 } else { 1 }, duration_ms],
         )?;
         Ok(())
     }

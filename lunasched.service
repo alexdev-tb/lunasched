@@ -4,8 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=lunasched
-Group=lunasched
+# Run as root to allow sudo-based user switching
+# Jobs are executed as specified users via sudo -u
+User=root
+Group=root
 WorkingDirectory=/var/lib/lunasched
 ExecStart=/usr/local/bin/lunasched-daemon
 Restart=always
@@ -22,7 +24,8 @@ RuntimeDirectory=lunasched
 RuntimeDirectoryMode=0755
 
 # Security hardening
-NoNewPrivileges=true
+# Note: NoNewPrivileges must be false to allow sudo
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true

@@ -70,6 +70,9 @@ enum Commands {
     /// View job history
     History {
         id: String,
+        /// Show all history (default: last 5 executions)
+        #[arg(long)]
+        all: bool,
     },
     /// Remove a job
     Remove {
@@ -188,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
         },
         Commands::List => Request::ListJobs,
         Commands::Start { id } => Request::StartJob(JobId(id)),
-        Commands::History { id } => Request::GetHistory(JobId(id)),
+        Commands::History { id, all } => Request::GetHistory { 
+            job_id: JobId(id), 
+            limit: if all { None } else { Some(5) } 
+        },
         Commands::Remove { id } => Request::RemoveJob(JobId(id)),
         Commands::Get { id } => Request::GetJob(JobId(id)),
     };
@@ -196,27 +202,34 @@ async fn main() -> anyhow::Result<()> {
     let req_bytes = serde_json::to_vec(&req)?;
     stream.write_all(&req_bytes).await?;
 
-    // Add timeout to read operation
-    let mut buf = vec![0; 4096];
-    let n = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        stream.read(&mut buf)
-    ).await {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => {
-            eprintln!("Failed to read response from daemon: {}", e);
-            return Err(e.into());
-        }
-        Err(_) => {
-            eprintln!("Read timeout: daemon is not responding to the request");
-            eprintln!("The daemon may be stuck or overloaded. Check logs at: {}", common::DEFAULT_LOG_FILE);
-            return Err(anyhow::anyhow!("Read timeout"));
-        }
-    };
+    // Read complete response with proper buffering
+    let mut complete_buf = Vec::new();
+    let mut temp_buf = vec![0; 8192];
     
-    let resp: Response = serde_json::from_slice(&buf[0..n])?;
-
-    match resp {
+    loop {
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            stream.read(&mut temp_buf)
+        ).await {
+            Ok(Ok(0)) => break,  // EOF
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                eprintln!("Failed to read response from daemon: {}", e);
+                return Err(e.into());
+            }
+            Err(_) => {
+                eprintln!("Read timeout: daemon is not responding to the request");
+                eprintln!("The daemon may be stuck or overloaded. Check logs at: {}", common::DEFAULT_LOG_FILE);
+                return Err(anyhow::anyhow!("Read timeout"));
+            }
+        };
+        
+        complete_buf.extend_from_slice(&temp_buf[0..n]);
+        
+        // Try to parse - if successful, we have complete response
+        if let Ok(resp) = serde_json::from_slice::<Response>(&complete_buf) {
+            // Successfully parsed, handle response
+            match resp {
         Response::Ok => println!("Success"),
         Response::Error(e) => eprintln!("Error: {}", e),
         Response::JobList(jobs) => {
@@ -316,6 +329,17 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
-
-    Ok(())
+            
+            return Ok(());
+        }
+        
+        // If buffer grows too large, something is wrong
+        if complete_buf.len() > 10 * 1024 * 1024 {  // 10MB limit
+            eprintln!("Response too large: {} bytes", complete_buf.len());
+            return Err(anyhow::anyhow!("Response too large"));
+        }
+    }
+    
+    // If we get here, connection closed before complete response
+    Err(anyhow::anyhow!("Connection closed before receiving complete response"))
 }

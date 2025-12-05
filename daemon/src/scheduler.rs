@@ -5,9 +5,66 @@ use chrono::{Utc, DateTime, Duration, Timelike};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::db::Db;
-use crate::resource_manager;
 use dashmap::DashMap;
 use uuid::Uuid;
+use sysinfo::{System, ProcessRefreshKind};
+
+/// Calculate next retry delay based on backoff strategy
+fn calculate_backoff_delay(
+    attempt: u32,
+    strategy: &common::BackoffStrategy,
+    initial_delay: u64,
+    max_delay: u64,
+) -> u64 {
+    use common::BackoffStrategy;
+    
+    let delay = match strategy {
+        BackoffStrategy::Fixed => initial_delay,
+        BackoffStrategy::Linear => initial_delay * (attempt as u64 + 1),
+        BackoffStrategy::Exponential => {
+            let base_delay = initial_delay * 2_u64.pow(attempt);
+            base_delay
+        },
+    };
+    
+    delay.min(max_delay)
+}
+
+/// Monitor and enforce timeout for a process
+async fn enforce_timeout(
+    pid: u32,
+    timeout_seconds: u64,
+) -> Result<(), &'static str> {
+    let duration = std::time::Duration::from_secs(timeout_seconds);
+    
+    tokio::time::sleep(duration).await;
+    
+    // Check if process is still running
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessRefreshKind::everything());
+    
+    if system.process(sysinfo::Pid::from_u32(pid)).is_some() {
+        // Process still running, kill it
+        log::warn!("Process {} exceeded timeout of {}s, terminating", pid, timeout_seconds);
+        
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        
+        // Give it a moment to clean up
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        
+        // Force kill if still alive
+        system.refresh_processes_specifics(ProcessRefreshKind::everything());
+        if system.process(sysinfo::Pid::from_u32(pid)).is_some() {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        }
+        
+        return Err("Process timeout exceeded");
+    }
+    
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct JobExecutionContext {
@@ -313,61 +370,56 @@ impl Scheduler {
         self.running_jobs.remove(id);
     }
 
-    pub fn execute_job(&self, job: &Job, scheduler: Arc<Mutex<Scheduler>>) {
-        let current_attempt = {
+    pub fn execute_job(scheduler: Arc<Mutex<Scheduler>>, job: &Job) {
+        let (current_attempt, db, retry_policy, hooks) = {
             let sched = scheduler.lock().unwrap();
-            sched.retry_state.get(&job.id.0).map(|s| s.attempt).unwrap_or(0)
+            let current_attempt = sched.retry_state.get(&job.id.0).map(|s| s.attempt).unwrap_or(0);
+            let db = sched.db.clone();
+            (current_attempt, db, job.retry_policy.clone(), job.hooks.clone())
         };
         
         log::info!("Executing job: {} (owner: {}, attempt: {})", job.name, job.owner, current_attempt + 1);
         
-        let mut cmd = tokio::process::Command::new(&job.command);
-        cmd.args(&job.args);
+        
+        // Construct full command string with args
+        let full_command = if job.args.is_empty() {
+            job.command.clone()
+        } else {
+            format!("{} {}", job.command, job.args.join(" "))
+        };
+        
+        // Prepare command with proper user switching using sudo
+        let mut cmd = tokio::process::Command::new("/usr/bin/sudo");
+        
+        // Run as specified user (defaults to "lunasched" if not specified)
+        let user = if job.owner.is_empty() { "lunasched" } else { &job.owner };
+        cmd.arg("-u");
+        cmd.arg(user);
+        
+        // Use shell to execute the command
+        cmd.arg("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg(&full_command);
+        
+        // Set environment variables (sudo will pass them through)
         cmd.envs(&job.env);
+        
+        // Set working directory to /tmp (always accessible)
+        cmd.current_dir("/tmp");
+        
+        log::info!("Executing as user '{}': /bin/sh -c '{}'", user, full_command);
+
+        // Configure I/O
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
         
         // Apply resource limits if configured
         let resource_limits = job.resource_limits.clone();
-        
-        if job.owner == "lunasched" {
-            match nix::unistd::User::from_name("lunasched") {
-                Ok(Some(user)) => {
-                    let uid = user.uid;
-                    let gid = user.gid;
-                    
-                    unsafe {
-                        cmd.pre_exec(move || {
-                            let c_user = std::ffi::CString::new("lunasched").unwrap();
-                            
-                            nix::unistd::initgroups(&c_user, gid)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                                
-                            nix::unistd::setgid(gid)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                                
-                            nix::unistd::setuid(uid)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                                
-                            Ok(())
-                        });
-                    }
-                },
-                Ok(None) => {
-                    log::error!("User 'lunasched' not found. Running as current user (likely root).");
-                },
-                Err(e) => {
-                    log::error!("Failed to lookup user 'lunasched': {}", e);
-                }
-            }
-        }
-
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
 
         let job_name = job.name.clone();
         let job_id = job.id.0.clone();
-        let db = self.db.clone();
-        let retry_policy = job.retry_policy.clone();
-        let hooks = job.hooks.clone();
+
 
         match cmd.spawn() {
             Ok(child) => {
@@ -377,7 +429,7 @@ impl Scheduler {
                 if let Some(timeout_secs) = resource_limits.timeout_seconds {
                     let pid_clone = pid;
                     tokio::spawn(async move {
-                        if let Err(e) = resource_manager::ResourceManager::enforce_timeout(pid_clone, timeout_secs).await {
+                        if let Err(e) = enforce_timeout(pid_clone, timeout_secs).await {
                             log::warn!("Timeout enforced: {}", e);
                         }
                     });
@@ -400,9 +452,9 @@ impl Scheduler {
                                 job_name, status_str, exit_code, duration_ms);
                             log::info!(target: "job_output", "Job: {}\n{}", job_name, log_output);
 
-                            // Update metrics
+                            // Log to database if configured
                             if let Some(ref db) = db {
-                                let _ = db.lock().unwrap().update_job_metrics(&job_id, success, duration_ms);
+                                // Metrics removed - keeping only history logging
                             }
 
                             if success {
@@ -430,7 +482,7 @@ impl Scheduler {
                                 
                                 if should_retry {
                                     let next_attempt = current_attempt + 1;
-                                    let delay_secs = resource_manager::calculate_backoff_delay(
+                                    let delay_secs = calculate_backoff_delay(
                                         current_attempt,
                                         &retry_policy.backoff_strategy,
                                         retry_policy.initial_delay_seconds,

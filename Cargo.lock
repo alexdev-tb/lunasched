@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "lunasched-daemon"
-version = "1.2.4"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "chrono",

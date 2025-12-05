@@ -1,6 +1,6 @@
 [package]
 name = "lunasched-daemon"
-version = "1.2.4"
+version = "3.0.0"
 edition = "2021"
 description = "Production-ready cron replacement with advanced scheduling, notifications, and metrics"
 license = "MIT"
@@ -37,7 +37,7 @@ maintainer = "Lunasched Team <team@lunasched.io>"
 copyright = "2025, Lunasched Team"
 license-file = ["../LICENSE", "4"]
 extended-description = """\
-Lunasched v1.2.0 - Production-ready cron replacement with advanced features.
+Lunasched v2.0.0 - Production-ready cron replacement with advanced features.
 
 Features:
  * Flexible scheduling (every X, at HH:MM, cron expressions)
@@ -62,6 +62,9 @@ assets = [
     
     # Systemd service (from project root)
     ["../lunasched.service", "lib/systemd/system/lunasched.service", "644"],
+    
+    # Sudoers configuration for passwordless sudo
+    ["../lunasched-sudoers", "etc/sudoers.d/lunasched", "440"],
     
     # Configuration (from project root)
     ["../lunasched-config.yaml", "etc/lunasched/config.yaml", "644"],

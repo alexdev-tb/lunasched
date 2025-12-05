@@ -8,11 +8,12 @@ if [ "$1" = "purge" ]; then
     rm -rf /var/log/lunasched
     rm -rf /var/run/lunasched
     
+    # Remove sudoers file
+    rm -f /etc/sudoers.d/lunasched
+    
     # Remove user
     if id "lunasched" &>/dev/null; then
         userdel lunasched || true
     fi
     
-    # Note: We don't remove /etc/lunasched/config.yaml 
-    # as it's marked as a conffile in debian package
 fi

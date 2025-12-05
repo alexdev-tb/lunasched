@@ -5,7 +5,7 @@
 ### Install the Package
 
 ```bash
-sudo dpkg -i target/debian/lunasched_1.2.0-1_amd64.deb
+sudo dpkg -i target/debian/lunasched_<version>-1_amd64.deb
 ```
 
 If you encounter dependency issues, run:

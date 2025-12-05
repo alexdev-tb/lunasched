@@ -139,21 +139,6 @@ impl Migrator {
             [],
         )?;
 
-        // Create job metrics table
-        tx.execute(
-            "CREATE TABLE IF NOT EXISTS job_metrics (
-                job_id TEXT PRIMARY KEY,
-                total_runs INTEGER DEFAULT 0,
-                successful_runs INTEGER DEFAULT 0,
-                failed_runs INTEGER DEFAULT 0,
-                avg_duration_ms INTEGER DEFAULT 0,
-                last_duration_ms INTEGER DEFAULT 0,
-                last_run_at DATETIME,
-                FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-            )",
-            [],
-        )?;
-
         // Create job dependencies table
         tx.execute(
             "CREATE TABLE IF NOT EXISTS job_dependencies (

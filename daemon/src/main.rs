@@ -1,10 +1,6 @@
 mod scheduler;
 mod db;
 mod migrations;
-mod config;
-mod resource_manager;
-mod notifier;
-mod metrics;
 
 use tokio::net::UnixListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,10 +11,37 @@ use db::Db;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Set up panic handler BEFORE anything else
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info.location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| String::from(""));
+        let payload = panic_info.payload()
+            .downcast_ref::<&str>()
+            .map(|s| *s)
+            .or_else(|| panic_info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<no message>");
+        
+        log::error!("PANIC{}: {}", location, payload);
+        eprintln!("FATAL: Daemon panicked{}: {}", location, payload);
+        eprintln!("Check logs at: {}", common::DEFAULT_LOG_FILE);
+    }));
+    
     setup_logging()?;
-    log::info!("Starting lunasched-daemon...");
+    log::info!("Starting lunasched-daemon v{}...", env!("CARGO_PKG_VERSION"));
 
     let db_path = common::DEFAULT_DB_PATH;
+    
+    // Ensure parent directories exist
+    if let Some(parent) = std::path::Path::new(db_path).parent() {
+        if !parent.exists() {
+            log::info!("Creating database directory: {}", parent.display());
+            std::fs::create_dir_all(parent).map_err(|e| {
+                log::error!("Failed to create database directory: {}", e);
+                anyhow::anyhow!("Failed to create database directory: {}", e)
+            })?;
+        }
+    }
     
     // Open database and run migrations
     let db = match rusqlite::Connection::open(db_path) {
@@ -34,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Err(e) => {
             log::error!("Failed to open database at {}: {}", db_path, e);
+            log::warn!("Continuing without database - jobs will not persist");
             None
         }
     };
@@ -100,150 +124,223 @@ async fn main() -> anyhow::Result<()> {
 
             for job in jobs {
                 let s = tick_scheduler.clone();
+                // Don't hold lock while executing jobs!
                 tokio::spawn(async move {
-                    let sched = s.lock().unwrap();
-                    sched.execute_job(&job, s.clone());
+                    // Execute job without holding lock
+                    Scheduler::execute_job(s.clone(), &job);
                 });
             }
         }
     });
 
+    // Set up signal handling for graceful shutdown
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    
+    log::info!("Daemon initialization complete, ready to accept connections");
+
+    // Main accept loop with graceful shutdown
     loop {
-        let (mut socket, addr) = listener.accept().await?;
-        log::info!("New connection accepted from {:?}", addr);
-        let scheduler = scheduler.clone();
+        tokio::select! {
+            // Handle incoming connections
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((mut socket, addr)) => {
+                        log::info!("New connection accepted from {:?}", addr);
+                        let scheduler = scheduler.clone();
 
-        tokio::spawn(async move {
-            let peer_uid = match socket.peer_cred() {
-                Ok(cred) => cred.uid(),
-                Err(e) => {
-                    log::error!("Failed to get peer credentials: {}", e);
-                    return;
-                }
-            };
+                        tokio::spawn(async move {
+                            let peer_uid = match socket.peer_cred() {
+                                Ok(cred) => cred.uid(),
+                                Err(e) => {
+                                    log::error!("Failed to get peer credentials: {}", e);
+                                    return;
+                                }
+                            };
 
-            let mut buf = vec![0; 1024];
-            loop {
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(e) => {
-                        log::error!("failed to read from socket; err = {:?}", e);
-                        return;
+                            // Read complete message with proper buffering
+                            let mut complete_buf = Vec::new();
+                            let mut temp_buf = vec![0; 8192];
+                            
+                            loop {
+                                let n = match socket.read(&mut temp_buf).await {
+                                    Ok(0) => {
+                                        if complete_buf.is_empty() {
+                                            return;  // Connection closed
+                                        }
+                                        break;  // EOF, process what we have
+                                    }
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        log::error!("failed to read from socket; err = {:?}", e);
+                                        return;
+                                    }
+                                };
+                                
+                                complete_buf.extend_from_slice(&temp_buf[0..n]);
+                                
+                                // Try to parse - if successful, we have a complete message
+                                if let Ok(req) = serde_json::from_slice::<Request>(&complete_buf) {
+                                    // Process the request
+                                    let mut request = req;
+                                    let requester_owner = if peer_uid == 0 { "root" } else { "lunasched" };
+
+                                    // Override owner for AddJob
+                                    if let Request::AddJob(ref mut job) = request {
+                                        job.owner = requester_owner.to_string();
+                                    }
+
+                                    log::info!("Received request: {:?}", request);
+                                    
+                                    let resp = match request {
+                                        Request::AddJob(job) => {
+                                            let response = {
+                                                let mut sched = scheduler.lock().unwrap();
+                                                // Check if job exists and verify ownership
+                                                if let Some(existing) = sched.jobs.get(&job.id.0) {
+                                                    if existing.owner != requester_owner && requester_owner != "root" {
+                                                        Response::Error(format!("Permission denied: Cannot overwrite job owned by {}", existing.owner))
+                                                    } else {
+                                                        sched.add_job(job);
+                                                        Response::Ok
+                                                    }
+                                                } else {
+                                                    sched.add_job(job);
+                                                    Response::Ok
+                                                }
+                                            };
+                                            response
+                                        },
+                                        Request::ListJobs => {
+                                            let jobs = {
+                                                let sched = scheduler.lock().unwrap();
+                                                sched.jobs.values().cloned().collect()
+                                            };
+                                            Response::JobList(jobs)
+                                        },
+                                        Request::StartJob(job_id) => {
+                                            let response = {
+                                                let sched = scheduler.lock().unwrap();
+                                                if let Some(job) = sched.jobs.get(&job_id.0) {
+                                                     if job.owner != requester_owner && requester_owner != "root" {
+                                                         Response::Error(format!("Permission denied: Cannot start job owned by {}", job.owner))
+                                                     } else if sched.running_jobs.contains_key(&job_id.0) {
+                                                         Response::Error("Job is already running".to_string())
+                                                     } else {
+                                                         let job_clone = job.clone();
+                                                         
+                                                         // Create execution context for manual start
+                                                         let execution_id = uuid::Uuid::new_v4().to_string();
+                                                         let now = chrono::Utc::now();
+                                                         sched.running_jobs.insert(
+                                                             job_id.0.clone(),
+                                                             scheduler::JobExecutionContext {
+                                                                 execution_id: execution_id.clone(),
+                                                                 scheduled_time: now,
+                                                                 start_time: now,
+                                                                 pid: None,
+                                                             },
+                                                         );
+                                                         
+                                                         log::info!("Manually starting job: {} (execution_id: {})", job_clone.name, execution_id);
+                                                         
+                                                         let s = scheduler.clone();
+                                                         drop(sched);  // Drop lock before executing job
+                                                         Scheduler::execute_job(s, &job_clone);
+                                                         Response::Ok
+                                                     }
+                                                } else {
+                                                    Response::Error("Job not found".to_string())
+                                                }
+                                            };
+                                            response
+                                        },
+                                        Request::RemoveJob(id) => {
+                                            let response = {
+                                                let mut sched = scheduler.lock().unwrap();
+                                                if let Some(job) = sched.jobs.get(&id.0) {
+                                                    if job.owner != requester_owner && requester_owner != "root" {
+                                                        Response::Error(format!("Permission denied: Cannot remove job owned by {}", job.owner))
+                                                    } else {
+                                                        sched.remove_job(&id.0);
+                                                        Response::Ok
+                                                    }
+                                                } else {
+                                                    Response::Error("Job not found".to_string())
+                                                }
+                                            };
+                                            response
+                                        },
+                                        Request::GetJob(id) => {
+                                            let job_opt = {
+                                                let sched = scheduler.lock().unwrap();
+                                                sched.jobs.get(&id.0).cloned()
+                                            };
+                                            Response::JobDetail(job_opt)
+                                        },
+                                        Request::GetHistory { job_id, limit } => {
+                                            let sched = scheduler.lock().unwrap();
+                                            if let Some(ref db) = sched.db {
+                                                match db.lock().unwrap().get_history(&job_id.0, limit) {
+                                                    Ok(history) => Response::HistoryList(history),
+                                                    Err(e) => Response::Error(format!("DB Error: {}", e)),
+                                                }
+                                            } else {
+                                                Response::Error("No database configured".to_string())
+                                            }
+                                        },
+                                    };
+                                    
+                                    log::debug!("About to serialize response: {:?}", resp);
+                                    let resp_bytes = serde_json::to_vec(&resp).unwrap();
+                                    log::debug!("Response serialized, {} bytes", resp_bytes.len());
+
+                                    if let Err(e) = socket.write_all(&resp_bytes).await {
+                                        log::error!("failed to write to socket; err = {:?}", e);
+                                        return;
+                                    }
+                                    
+                                    // Clear buffer for next request
+                                    complete_buf.clear();
+                                    continue;
+                                }
+                                
+                                // If buffer grows too large, something is wrong
+                                if complete_buf.len() > 1024 * 1024 {  // 1MB limit
+                                    log::error!("Request too large: {} bytes", complete_buf.len());
+                                    return;
+                                }
+                            }
+
+                        });
                     }
-                };
-
-                let mut req: Request = match serde_json::from_slice(&buf[0..n]) {
-                    Ok(req) => req,
                     Err(e) => {
-                        log::error!("failed to deserialize request; err = {:?}", e);
-                        log::error!("Raw bytes received: {} bytes", n);
-                        return;
+                        log::error!("Accept error: {}", e);
+                        // Continue on accept errors instead of crashing
+                        continue;
                     }
-                };
-
-                log::info!("Received request: {:?}", req);
-                
-                let requester_owner = if peer_uid == 0 { "root" } else { "lunasched" };
-
-                // Override owner for AddJob
-                if let Request::AddJob(ref mut job) = req {
-                    job.owner = requester_owner.to_string();
                 }
-                
-                let resp = match req {
-                    Request::AddJob(job) => {
-                        let mut sched = scheduler.lock().unwrap();
-                        // Check if job exists and verify ownership
-                        if let Some(existing) = sched.jobs.get(&job.id.0) {
-                            if existing.owner != requester_owner && requester_owner != "root" {
-                                Response::Error(format!("Permission denied: Cannot overwrite job owned by {}", existing.owner))
-                            } else {
-                                sched.add_job(job);
-                                Response::Ok
-                            }
-                        } else {
-                            sched.add_job(job);
-                            Response::Ok
-                        }
-                    },
-                    Request::ListJobs => {
-                        let sched = scheduler.lock().unwrap();
-                        let jobs = sched.jobs.values().cloned().collect();
-                        Response::JobList(jobs)
-                    },
-                    Request::StartJob(job_id) => {
-                        let sched = scheduler.lock().unwrap();
-                        if let Some(job) = sched.jobs.get(&job_id.0) {
-                             if job.owner != requester_owner && requester_owner != "root" {
-                                 Response::Error(format!("Permission denied: Cannot start job owned by {}", job.owner))
-                             } else if sched.running_jobs.contains_key(&job_id.0) {
-                                 Response::Error("Job is already running".to_string())
-                             } else {
-                                 let job_clone = job.clone();
-                                 
-                                 // Create execution context for manual start
-                                 let execution_id = uuid::Uuid::new_v4().to_string();
-                                 let now = chrono::Utc::now();
-                                 sched.running_jobs.insert(
-                                     job_id.0.clone(),
-                                     scheduler::JobExecutionContext {
-                                         execution_id: execution_id.clone(),
-                                         scheduled_time: now,
-                                         start_time: now,
-                                         pid: None,
-                                     },
-                                 );
-                                 
-                                 log::info!("Manually starting job: {} (execution_id: {})", job_clone.name, execution_id);
-                                 
-                                 let s = scheduler.clone();
-                                 sched.execute_job(&job_clone, s);
-                                 Response::Ok
-                             }
-                        } else {
-                            Response::Error("Job not found".to_string())
-                        }
-                    },
-                    Request::RemoveJob(id) => {
-                        let mut sched = scheduler.lock().unwrap();
-                        if let Some(job) = sched.jobs.get(&id.0) {
-                            if job.owner != requester_owner && requester_owner != "root" {
-                                Response::Error(format!("Permission denied: Cannot remove job owned by {}", job.owner))
-                            } else {
-                                sched.remove_job(&id.0);
-                                Response::Ok
-                            }
-                        } else {
-                            Response::Error("Job not found".to_string())
-                        }
-                    },
-                    Request::GetJob(id) => {
-                        let sched = scheduler.lock().unwrap();
-                        Response::JobDetail(sched.jobs.get(&id.0).cloned())
-                    },
-                    Request::GetHistory(job_id) => {
-                        let sched = scheduler.lock().unwrap();
-                        if let Some(ref db) = sched.db {
-                            match db.lock().unwrap().get_history(&job_id.0) {
-                                Ok(history) => Response::HistoryList(history),
-                                Err(e) => Response::Error(format!("DB Error: {}", e)),
-                            }
-                        } else {
-                            Response::Error("No database configured".to_string())
-                        }
-                    },
-                };
-
-                let resp_bytes = serde_json::to_vec(&resp).unwrap();
-
-                if let Err(e) = socket.write_all(&resp_bytes).await {
-                    eprintln!("failed to write to socket; err = {:?}", e);
-                    return;
-                }
-            }
-        });
+            },
+            // Handle SIGTERM
+            _ = sigterm.recv() => {
+                log::info!("Received SIGTERM, initiating graceful shutdown...");
+                break;
+            },
+            // Handle SIGINT (Ctrl+C)
+            _ = sigint.recv() => {
+                log::info!("Received SIGINT, initiating graceful shutdown...");
+                break;
+            },
+        }
     }
+    
+    // Cleanup
+    log::info!("Graceful shutdown complete");
+    if let Err(e) = std::fs::remove_file(socket_path) {
+        log::warn!("Failed to remove socket file: {}", e);
+    }
+    
+    Ok(())
 }
 
 fn setup_logging() -> anyhow::Result<()> {

@@ -1,0 +1,9 @@
+# Lunasched sudoers configuration
+# This allows the lunasched daemon (running as root) to execute jobs as any user
+# without requiring a password prompt
+
+# Allow root to run commands as any user via lunasched
+root ALL=(ALL) NOPASSWD: /bin/sh
+
+# If running daemon as lunasched user in the future:
+# lunasched ALL=(ALL) NOPASSWD: /bin/sh
